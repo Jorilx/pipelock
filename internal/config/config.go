@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -185,6 +186,7 @@ type Config struct {
 	MCPSessionBinding     MCPSessionBinding       `yaml:"mcp_session_binding"`
 	RequestBodyScanning   RequestBodyScanning     `yaml:"request_body_scanning"`
 	KillSwitch            KillSwitch              `yaml:"kill_switch"`
+	Sentry                SentryConfig            `yaml:"sentry"`
 	MetricsListen         string                  `yaml:"metrics_listen"` // separate listen address for /metrics and /stats
 	Emit                  EmitConfig              `yaml:"emit"`
 	ToolChainDetection    ToolChainDetection      `yaml:"tool_chain_detection"`
@@ -491,6 +493,29 @@ type SyslogConfig struct {
 type MCPWSListener struct {
 	AllowedOrigins []string `yaml:"allowed_origins"` // additional browser origins to allow (loopback always allowed)
 	MaxConnections int      `yaml:"max_connections"` // max concurrent inbound WS connections (default 100)
+}
+
+// SentryConfig configures Sentry error reporting with secret redaction.
+// All error data is scrubbed through DLP patterns before leaving the process.
+type SentryConfig struct {
+	Enabled     *bool    `yaml:"enabled"`     // nil = true (default enabled)
+	DSN         string   `yaml:"dsn"`         // Sentry DSN; also reads SENTRY_DSN env
+	Environment string   `yaml:"environment"` // e.g. "production" (default)
+	SampleRate  *float64 `yaml:"sample_rate"` // nil = 1.0; 0.0-1.0
+	Debug       bool     `yaml:"debug"`       // SDK debug mode
+}
+
+// IsEnabled returns true if Sentry is enabled (nil defaults to true).
+func (s *SentryConfig) IsEnabled() bool {
+	return s.Enabled == nil || *s.Enabled
+}
+
+// EffectiveSampleRate returns the configured sample rate (nil defaults to 1.0).
+func (s *SentryConfig) EffectiveSampleRate() float64 {
+	if s.SampleRate == nil {
+		return 1.0
+	}
+	return *s.SampleRate
 }
 
 // ToolChainDetection configures MCP tool call chain pattern detection.
@@ -916,6 +941,11 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Emit.Syslog.Tag == "" {
 		c.Emit.Syslog.Tag = "pipelock"
+	}
+
+	// Sentry defaults (nil sample_rate = 1.0, handled by EffectiveSampleRate())
+	if c.Sentry.Environment == "" {
+		c.Sentry.Environment = "production"
 	}
 
 	// Tool chain detection defaults
@@ -1603,6 +1633,15 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Validate Sentry config
+	sr := c.Sentry.EffectiveSampleRate()
+	if math.IsNaN(sr) {
+		return fmt.Errorf("invalid sentry.sample_rate: NaN not allowed")
+	}
+	if sr < 0 || sr > 1 {
+		return fmt.Errorf("invalid sentry.sample_rate %f: must be between 0.0 and 1.0", sr)
+	}
+
 	// Validate internal CIDRs are parseable
 	for _, cidr := range c.Internal {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
@@ -1900,7 +1939,47 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 		}
 	}
 
+	// Sentry DSN changed (requires restart — scrubber is built once at init)
+	if old.Sentry.DSN != updated.Sentry.DSN {
+		warnings = append(warnings, ReloadWarning{Field: "sentry.dsn", Message: "Sentry DSN changes require restart"})
+	}
+
+	// Sentry scrubber uses DLP patterns, env secrets, and file secrets from
+	// init time. Warn on ANY change that would affect scrubbing coverage.
+	if dlpPatternsChanged(old.DLP.Patterns, updated.DLP.Patterns) {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "sentry",
+			Message: "DLP patterns changed; Sentry scrubber uses init-time patterns until restart",
+		})
+	}
+	if old.DLP.ScanEnv != updated.DLP.ScanEnv {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "sentry",
+			Message: "dlp.scan_env changed; Sentry scrubber uses init-time env secrets until restart",
+		})
+	}
+	if old.DLP.SecretsFile != updated.DLP.SecretsFile {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "sentry",
+			Message: "dlp.secrets_file changed; Sentry scrubber uses init-time file secrets until restart",
+		})
+	}
+
 	return warnings
+}
+
+// dlpPatternsChanged returns true if the DLP pattern set differs between old
+// and new configs (count change or regex content change).
+func dlpPatternsChanged(old, updated []DLPPattern) bool {
+	if len(old) != len(updated) {
+		return true
+	}
+	for i := range old {
+		if old[i].Regex != updated[i].Regex {
+			return true
+		}
+	}
+	return false
 }
 
 // passthroughDomainsAdded returns domains present in updated but not in old.

@@ -30,6 +30,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	plsentry "github.com/luckyPipewrench/pipelock/internal/sentry"
 )
 
 func runCmd() *cobra.Command {
@@ -103,6 +104,15 @@ Examples:
 				return fmt.Errorf("invalid config: %w", err)
 			}
 
+			// Set up Sentry error reporting
+			sentryClient, sentryErr := plsentry.Init(cfg, Version)
+			if sentryErr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: sentry init failed: %v\n", sentryErr)
+			}
+			if sentryClient != nil {
+				defer sentryClient.Close()
+			}
+
 			// Set up audit logger
 			logger, err := audit.New(
 				cfg.Logging.Format,
@@ -172,6 +182,9 @@ Examples:
 
 			// Load TLS interception CA if configured.
 			if err := p.LoadCertCache(cfg); err != nil {
+				if sentryClient != nil {
+					sentryClient.CaptureError(err)
+				}
 				return err
 			}
 
@@ -204,8 +217,7 @@ Examples:
 						func() {
 							defer func() {
 								if r := recover(); r != nil {
-									logger.LogError("CONFIG_RELOAD", configFile, "", "", "",
-										fmt.Errorf("scanner construction panic: %v", r))
+									reloadPanicHandler(r, sentryClient, logger, configFile)
 								}
 							}()
 							// Check for security downgrades before applying
@@ -389,7 +401,11 @@ Examples:
 
 				apiLn, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.KillSwitch.APIListen)
 				if lnErr != nil {
-					return fmt.Errorf("kill switch API bind %s: %w", cfg.KillSwitch.APIListen, lnErr)
+					err := fmt.Errorf("kill switch API bind %s: %w", cfg.KillSwitch.APIListen, lnErr)
+					if sentryClient != nil {
+						sentryClient.CaptureError(err)
+					}
+					return err
 				}
 
 				apiSrv := &http.Server{
@@ -425,7 +441,11 @@ Examples:
 
 				metricsLn, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.MetricsListen)
 				if lnErr != nil {
-					return fmt.Errorf("metrics bind %s: %w", cfg.MetricsListen, lnErr)
+					err := fmt.Errorf("metrics bind %s: %w", cfg.MetricsListen, lnErr)
+					if sentryClient != nil {
+						sentryClient.CaptureError(err)
+					}
+					return err
 				}
 				metricsSrv := &http.Server{
 					Handler:           metricsMux,
@@ -501,7 +521,11 @@ Examples:
 				// would be silently swallowed until shutdown.
 				mcpLn, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", mcpListen)
 				if lnErr != nil {
-					return fmt.Errorf("MCP listener bind %s: %w", mcpListen, lnErr)
+					err := fmt.Errorf("MCP listener bind %s: %w", mcpListen, lnErr)
+					if sentryClient != nil {
+						sentryClient.CaptureError(err)
+					}
+					return err
 				}
 
 				// Initialize chain matcher for MCP listener if configured.
@@ -558,7 +582,11 @@ Examples:
 				for addr, name := range agentPorts {
 					ln, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
 					if lnErr != nil {
-						return fmt.Errorf("agent %q listener bind %s: %w", name, addr, lnErr)
+						err := fmt.Errorf("agent %q listener bind %s: %w", name, addr, lnErr)
+						if sentryClient != nil {
+							sentryClient.CaptureError(err)
+						}
+						return err
 					}
 					srv := &http.Server{
 						Handler:           agentHandler(name, handler),
@@ -608,6 +636,9 @@ Examples:
 
 			// Start the fetch proxy (blocks until context cancelled or error).
 			if err := p.Start(ctx); err != nil {
+				if sentryClient != nil {
+					sentryClient.CaptureError(err)
+				}
 				return fmt.Errorf("proxy error: %w", err)
 			}
 
@@ -754,6 +785,20 @@ func agentListenersChanged(oldCfg, newCfg *config.Config) bool {
 		}
 	}
 	return false
+}
+
+// reloadPanicHandler captures panics during config reload, reports them to
+// Sentry, and logs the error. Extracted from the reload goroutine for
+// testability.
+func reloadPanicHandler(r any, sentryClient *plsentry.Client, logger *audit.Logger, configFile string) {
+	if r == nil {
+		return
+	}
+	reloadErr := fmt.Errorf("scanner construction panic during config reload: %v", r)
+	if sentryClient != nil {
+		sentryClient.CaptureError(reloadErr)
+	}
+	logger.LogError("CONFIG_RELOAD", configFile, "", "", "", reloadErr)
 }
 
 // preserveAgentListeners keeps the new config's agent listener state

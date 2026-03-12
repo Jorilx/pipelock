@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -27,6 +28,7 @@ const (
 	fieldFwdProxy       = "forward_proxy.enabled"
 	fieldKSAPIListen    = "kill_switch.api_listen"
 	fieldTLSPassthrough = "tls_interception.passthrough_domains"
+	fieldSentry         = "sentry"
 
 	// testLicenseFileCfg is a minimal config with license_file pointing to a
 	// relative file name. Used in multiple license loading tests.
@@ -1306,8 +1308,9 @@ func TestValidateReload_MultipleWarnings(t *testing.T) {
 	updated.ResponseScanning.Enabled = false
 
 	warnings := ValidateReload(old, updated)
-	if len(warnings) != 5 {
-		t.Errorf("expected 5 warnings, got %d", len(warnings))
+	// 5 original warnings + 1 sentry DLP pattern count warning
+	if len(warnings) != 6 {
+		t.Errorf("expected 6 warnings, got %d", len(warnings))
 		for _, w := range warnings {
 			t.Logf("  %s: %s", w.Field, w.Message)
 		}
@@ -5780,5 +5783,233 @@ func TestLoad_ExplicitTruePreserved(t *testing.T) {
 		if !c.got {
 			t.Errorf("%s = false, want true (explicit true must survive introspection)", c.name)
 		}
+	}
+}
+
+// --- Sentry tests ---
+
+func TestEnabled_NilDefaultsTrue(t *testing.T) {
+	cfg := SentryConfig{}
+	if !cfg.IsEnabled() {
+		t.Error("expected Enabled() to return true when Enabled is nil")
+	}
+}
+
+func TestEnabled_ExplicitlyFalse(t *testing.T) {
+	f := false
+	cfg := SentryConfig{Enabled: &f}
+	if cfg.IsEnabled() {
+		t.Error("expected Enabled() to return false when Enabled is explicitly false")
+	}
+}
+
+func TestEnabled_ExplicitlyTrue(t *testing.T) {
+	tr := true
+	cfg := SentryConfig{Enabled: &tr}
+	if !cfg.IsEnabled() {
+		t.Error("expected Enabled() to return true when Enabled is explicitly true")
+	}
+}
+
+func floatPtr(f float64) *float64 { return &f }
+
+func TestSampleRate_NilDefaultsToOne(t *testing.T) {
+	cfg := SentryConfig{}
+	if cfg.EffectiveSampleRate() != 1.0 {
+		t.Errorf("expected 1.0 for nil, got %f", cfg.EffectiveSampleRate())
+	}
+}
+
+func TestSampleRate_ExplicitZero(t *testing.T) {
+	cfg := SentryConfig{SampleRate: floatPtr(0.0)}
+	if cfg.EffectiveSampleRate() != 0.0 {
+		t.Errorf("expected 0.0 for explicit zero, got %f", cfg.EffectiveSampleRate())
+	}
+}
+
+func TestSampleRate_ExplicitValue(t *testing.T) {
+	cfg := SentryConfig{SampleRate: floatPtr(0.5)}
+	if cfg.EffectiveSampleRate() != 0.5 {
+		t.Errorf("expected 0.5, got %f", cfg.EffectiveSampleRate())
+	}
+}
+
+func TestApplyDefaults_SampleRate(t *testing.T) {
+	cfg := Defaults()
+	cfg.ApplyDefaults()
+	if cfg.Sentry.EffectiveSampleRate() != 1.0 {
+		t.Errorf("expected default sample_rate 1.0, got %f", cfg.Sentry.EffectiveSampleRate())
+	}
+}
+
+func TestApplyDefaults_SentryEnvironment(t *testing.T) {
+	cfg := Defaults()
+	cfg.ApplyDefaults()
+	if cfg.Sentry.Environment != "production" {
+		t.Errorf("expected default environment 'production', got %q", cfg.Sentry.Environment)
+	}
+}
+
+func TestApplyDefaults_SentryPreservesCustomValues(t *testing.T) {
+	cfg := Defaults()
+	cfg.Sentry.SampleRate = floatPtr(0.5)
+	cfg.Sentry.Environment = "staging"
+	cfg.ApplyDefaults()
+	if cfg.Sentry.EffectiveSampleRate() != 0.5 {
+		t.Errorf("expected preserved sample_rate 0.5, got %f", cfg.Sentry.EffectiveSampleRate())
+	}
+	if cfg.Sentry.Environment != "staging" {
+		t.Errorf("expected preserved environment 'staging', got %q", cfg.Sentry.Environment)
+	}
+}
+
+func TestValidate_SampleRateTooHigh(t *testing.T) {
+	cfg := Defaults()
+	cfg.Sentry.SampleRate = floatPtr(1.5)
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for sample_rate > 1.0")
+	}
+}
+
+func TestValidate_SampleRateNegative(t *testing.T) {
+	cfg := Defaults()
+	cfg.Sentry.SampleRate = floatPtr(-0.1)
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for negative sample_rate")
+	}
+}
+
+func TestValidate_SampleRateValid(t *testing.T) {
+	cfg := Defaults()
+	cfg.Sentry.SampleRate = floatPtr(0.5)
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("expected valid config, got: %v", err)
+	}
+}
+
+func TestValidate_SampleRateZeroIsValid(t *testing.T) {
+	cfg := Defaults()
+	cfg.Sentry.SampleRate = floatPtr(0.0)
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("expected sample_rate 0.0 to be valid (disables sampling), got: %v", err)
+	}
+}
+
+func TestValidate_SampleRateNaN(t *testing.T) {
+	cfg := Defaults()
+	nan := math.NaN()
+	cfg.Sentry.SampleRate = &nan
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for NaN sample_rate")
+	}
+}
+
+func TestValidateReload_SentryDSNChanged(t *testing.T) {
+	old := Defaults()
+	old.Sentry.DSN = "https://old@sentry.io/1"
+	updated := Defaults()
+	updated.Sentry.DSN = "https://new@sentry.io/2"
+	warnings := ValidateReload(old, updated)
+	found := false
+	for _, w := range warnings {
+		if w.Field == "sentry.dsn" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected warning for sentry.dsn change")
+	}
+}
+
+func TestValidateReload_SentryDSNUnchanged_NoWarning(t *testing.T) {
+	old := Defaults()
+	old.Sentry.DSN = "https://same@sentry.io/1"
+	updated := Defaults()
+	updated.Sentry.DSN = "https://same@sentry.io/1"
+	warnings := ValidateReload(old, updated)
+	for _, w := range warnings {
+		if w.Field == "sentry.dsn" {
+			t.Error("expected no warning when sentry.dsn unchanged")
+		}
+	}
+}
+
+func TestValidateReload_DLPPatternCountChanged_SentryWarning(t *testing.T) {
+	old := Defaults()
+	updated := Defaults()
+	updated.DLP.Patterns = append(updated.DLP.Patterns, DLPPattern{
+		Name: "Extra", Regex: `extra`, Severity: "high",
+	})
+	warnings := ValidateReload(old, updated)
+	found := false
+	for _, w := range warnings {
+		if w.Field == fieldSentry {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected sentry warning when DLP pattern count changes")
+	}
+}
+
+func TestValidateReload_DLPPatternCountSame_NoSentryWarning(t *testing.T) {
+	old := Defaults()
+	updated := Defaults()
+	warnings := ValidateReload(old, updated)
+	for _, w := range warnings {
+		if w.Field == fieldSentry {
+			t.Error("expected no sentry warning when DLP patterns unchanged")
+		}
+	}
+}
+
+func TestValidateReload_DLPPatternRegexChanged_SentryWarning(t *testing.T) {
+	old := Defaults()
+	updated := Defaults()
+	// Same count, but change the regex content of the first pattern.
+	updated.DLP.Patterns[0].Regex = `different-regex-[a-z]+`
+	warnings := ValidateReload(old, updated)
+	found := false
+	for _, w := range warnings {
+		if w.Field == fieldSentry {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected sentry warning when DLP pattern regex content changes")
+	}
+}
+
+func TestValidateReload_ScanEnvToggled_SentryWarning(t *testing.T) {
+	old := Defaults()
+	old.DLP.ScanEnv = true
+	updated := Defaults()
+	updated.DLP.ScanEnv = false
+	warnings := ValidateReload(old, updated)
+	found := false
+	for _, w := range warnings {
+		if w.Field == fieldSentry && strings.Contains(w.Message, "scan_env") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected sentry warning when dlp.scan_env changes")
+	}
+}
+
+func TestValidateReload_SecretsFileChanged_SentryWarning(t *testing.T) {
+	old := Defaults()
+	old.DLP.SecretsFile = "/old/secrets.txt"
+	updated := Defaults()
+	updated.DLP.SecretsFile = "/new/secrets.txt"
+	warnings := ValidateReload(old, updated)
+	found := false
+	for _, w := range warnings {
+		if w.Field == fieldSentry && strings.Contains(w.Message, "secrets_file") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected sentry warning when dlp.secrets_file changes")
 	}
 }

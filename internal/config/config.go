@@ -194,6 +194,16 @@ type TrustedKey struct {
 	PublicKey string `yaml:"public_key"` // 64 lowercase hex chars
 }
 
+// FileSentry configures real-time filesystem monitoring for agent processes.
+// Detects secrets written to disk by agent subprocesses that bypass
+// the MCP tool call path. Applies to subprocess MCP mode only.
+type FileSentry struct {
+	Enabled        bool     `yaml:"enabled"`
+	WatchPaths     []string `yaml:"watch_paths"`
+	ScanContent    *bool    `yaml:"scan_content"`    // nil = default true
+	IgnorePatterns []string `yaml:"ignore_patterns"` // glob patterns to skip
+}
+
 // Config is the top-level Pipelock configuration.
 type Config struct {
 	Version               int                     `yaml:"version"`
@@ -228,6 +238,7 @@ type Config struct {
 	AddressProtection     AddressProtection       `yaml:"address_protection"`
 	SeedPhraseDetection   SeedPhraseDetection     `yaml:"seed_phrase_detection"`
 	Rules                 Rules                   `yaml:"rules"`
+	FileSentry            FileSentry              `yaml:"file_sentry"`
 	Agents                map[string]AgentProfile `yaml:"agents,omitempty"`
 	LicenseKey            string                  `yaml:"license_key,omitempty"`        // signed license token (from pipelock license issue)
 	LicenseFile           string                  `yaml:"license_file,omitempty"`       // path to file containing the license token (read at startup)
@@ -793,6 +804,28 @@ func Load(path string) (*Config, error) {
 		cfg.TLSInterception.CAKeyPath = filepath.Join(configDir, cfg.TLSInterception.CAKeyPath)
 	}
 
+	// Resolve relative file_sentry.watch_paths against config file directory.
+	// "." in the config means the project directory, not whatever CWD the
+	// process happens to have (systemd sets CWD=/, containers vary).
+	//
+	// Relative paths with ".." traversal are rejected to prevent
+	// unintentional escapes. Absolute paths are allowed as-is since the
+	// user explicitly chose the target directory.
+	for i, p := range cfg.FileSentry.WatchPaths {
+		if !filepath.IsAbs(p) {
+			resolved := filepath.Clean(filepath.Join(configDir, p))
+			// Verify the resolved path is still under the config directory.
+			// filepath.Rel returns a ".." prefix if the target escapes.
+			rel, err := filepath.Rel(configDir, resolved)
+			if err != nil || strings.HasPrefix(rel, "..") {
+				return nil, fmt.Errorf("file_sentry: watch_paths[%d] %q escapes config directory (use absolute path instead)", i, p)
+			}
+			cfg.FileSentry.WatchPaths[i] = resolved
+		} else {
+			cfg.FileSentry.WatchPaths[i] = filepath.Clean(cfg.FileSentry.WatchPaths[i])
+		}
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -1313,6 +1346,11 @@ func (c *Config) ApplyDefaults() {
 	// Community rules defaults
 	if c.Rules.MinConfidence == "" {
 		c.Rules.MinConfidence = ConfidenceMedium
+	}
+
+	// File sentry defaults
+	if c.FileSentry.ScanContent == nil {
+		c.FileSentry.ScanContent = ptrBool(true)
 	}
 }
 
@@ -2093,6 +2131,18 @@ func (c *Config) Validate() error {
 		}
 		if len(decoded) != 32 {
 			return fmt.Errorf("rules: trusted_keys[%d] %q public_key must decode to 32 bytes", i, k.Name)
+		}
+	}
+
+	// Validate file sentry config
+	if c.FileSentry.Enabled {
+		if len(c.FileSentry.WatchPaths) == 0 {
+			return fmt.Errorf("file_sentry: watch_paths must be non-empty when enabled")
+		}
+		for i, p := range c.FileSentry.WatchPaths {
+			if p == "" {
+				return fmt.Errorf("file_sentry: watch_paths[%d] must not be empty", i)
+			}
 		}
 	}
 

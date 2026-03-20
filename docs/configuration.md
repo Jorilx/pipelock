@@ -1321,6 +1321,34 @@ At least one chain must be enabled when `address_protection.enabled` is `true`. 
 
 **Hot reload:** disabling address protection triggers a reload warning. Re-enabling takes effect immediately.
 
+## File Sentry
+
+Real-time filesystem monitoring for agent subprocesses. Detects secrets written to disk that bypass the MCP tool call path. Applies to subprocess MCP mode only (`pipelock mcp proxy -- COMMAND`).
+
+```yaml
+file_sentry:
+  enabled: false
+  watch_paths:
+    - "."
+  scan_content: true
+  ignore_patterns:
+    - "node_modules/**"
+    - ".git/**"
+    - "*.o"
+    - "*.so"
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Enable filesystem monitoring. Opt-in. |
+| `watch_paths` | `[]` | Directories to monitor recursively. Relative paths are resolved against the config file directory (not CWD). Required when enabled. |
+| `scan_content` | `true` | Run DLP scanner on modified file content. |
+| `ignore_patterns` | `[]` | Glob patterns for files and directories to skip. |
+
+File sentry is alert-only in the current release. Findings are reported as stderr warnings and Prometheus metrics (`pipelock_file_sentry_findings_total`). Structured audit log emission (`file_sentry_dlp` event type) is defined but not yet wired to the webhook/syslog pipeline. On Linux, process lineage tracking attributes file writes to the agent's process tree via `PR_SET_CHILD_SUBREAPER` and `/proc` walking.
+
+Files larger than 10MB are skipped. Write events are debounced (50ms quiet window) to avoid scanning partial writes.
+
 ## Community Rules
 
 Optional signed rule bundles that extend built-in detection patterns. See [docs/rules.md](rules.md) for the full user guide.

@@ -28,7 +28,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests==2.32.5
+        run: pip install --require-hashes -r .github/requirements-pr-review.txt
 
       - name: Determine review mode
         id: mode

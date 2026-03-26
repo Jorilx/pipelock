@@ -2754,8 +2754,8 @@ func TestSSRFSafeDialContext_TrustedDomainStillBlockedWhenNotTrusted(t *testing.
 	}
 }
 
-// TestSSRFSafeDialContext_DirectIPWithTrustedDomain verifies that trusted domains
-// bypass SSRF check even when connecting directly to an internal IP.
+// TestSSRFSafeDialContext_DirectIPWithTrustedDomain verifies that direct internal IP
+// connections are still SSRF-blocked even when trusted domains are configured.
 func TestSSRFSafeDialContext_DirectIPWithTrustedDomain(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Internal = []string{"10.0.0.0/8"}

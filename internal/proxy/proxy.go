@@ -654,17 +654,17 @@ func (p *Proxy) ssrfSafeDialContext(ctx context.Context, network, addr string) (
 	}
 
 	currentSc := p.scannerPtr.Load()
-	for _, ipStr := range ips {
-		ip := net.ParseIP(ipStr)
-		if ip == nil {
-			return nil, fmt.Errorf("SSRF blocked: unparseable IP %q from DNS for %s", ipStr, host)
-		}
-		// Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to 4-byte form.
-		if v4 := ip.To4(); v4 != nil {
-			ip = v4
-		}
-		if currentSc.IsInternalIP(ip) {
-			if !currentSc.IsTrustedDomain(host) {
+	if !currentSc.IsTrustedDomain(host) {
+		for _, ipStr := range ips {
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				return nil, fmt.Errorf("SSRF blocked: unparseable IP %q from DNS for %s", ipStr, host)
+			}
+			// Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to 4-byte form.
+			if v4 := ip.To4(); v4 != nil {
+				ip = v4
+			}
+			if currentSc.IsInternalIP(ip) {
 				return nil, fmt.Errorf("SSRF blocked: %s resolves to internal IP %s", host, ipStr)
 			}
 		}

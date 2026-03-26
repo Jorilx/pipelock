@@ -237,6 +237,30 @@ func TestAssessFinalize_SummaryNoLeakedFields(t *testing.T) {
 		}
 	}
 
+	// Check discover finding IDs don't leak server/client names.
+	if tfRaw2, ok := raw["top_findings"]; ok {
+		var findings []map[string]json.RawMessage
+		if err := json.Unmarshal(tfRaw2, &findings); err != nil {
+			t.Fatalf("parsing top_findings for ID check: %v", err)
+		}
+		for i, tf := range findings {
+			var id, source string
+			if idRaw, ok := tf["id"]; ok {
+				if err := json.Unmarshal(idRaw, &id); err != nil {
+					t.Fatalf("top_findings[%d] id unmarshal: %v", i, err)
+				}
+			}
+			if srcRaw, ok := tf["source"]; ok {
+				if err := json.Unmarshal(srcRaw, &source); err != nil {
+					t.Fatalf("top_findings[%d] source unmarshal: %v", i, err)
+				}
+			}
+			if source == sourceDiscover && !strings.HasPrefix(id, "find-discover-redacted-") {
+				t.Errorf("top_findings[%d] discover ID %q leaks server name (expected find-discover-redacted-*)", i, id)
+			}
+		}
+	}
+
 	// Check sections have no detail field.
 	if secRaw, ok := raw["sections"]; ok {
 		var sections []map[string]json.RawMessage
@@ -252,6 +276,27 @@ func TestAssessFinalize_SummaryNoLeakedFields(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestRedactDiscoverTitle(t *testing.T) {
+	tests := []struct {
+		severity string
+		want     string
+	}{
+		{assessSevHigh, "A high-risk MCP server is unprotected"},
+		{assessSevMedium, "An MCP server is unprotected"},
+		{assessSevLow, "An MCP server is unprotected"},
+		{assessSevCritical, "An MCP server is unprotected"},
+		{assessSevInfo, "An MCP server is unprotected"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.severity, func(t *testing.T) {
+			got := redactDiscoverTitle(tt.severity)
+			if got != tt.want {
+				t.Errorf("redactDiscoverTitle(%q) = %q, want %q", tt.severity, got, tt.want)
+			}
+		})
 	}
 }
 
